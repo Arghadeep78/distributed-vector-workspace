@@ -25,7 +25,8 @@ This project's emphasis is a backend that is safe to scale across multiple insta
 | **Board-metadata cache** | Access metadata (`owner`, `collaborators`, `isPublic`, `publicRole`, workspace members) is cached in Redis (`board:meta:<id>`, 60 s TTL) and explicitly invalidated on share / unshare / publish / delete — removing a cold MongoDB read from every WebSocket connection (`backend/cache/boardCache.js`). |
 | **External API resilience (design reference)** | The codebase previously included a `utils/resilience.js` with `withTimeout`, exponential-backoff `retry`, and an in-memory `CircuitBreaker` (5-failure threshold, 30 s cooldown) wrapping the (now-removed) AI calls. The file was removed with that feature; the patterns are documented in [concepts.md](concepts.md) as a reference for hardening calls to flaky external services. |
 | **Health & readiness probes** | `GET /health` checks live MongoDB + Redis (`503` when down); `GET /ready` additionally verifies BullMQ workers are running, reports persist-queue backpressure (not-ready when the flush backlog exceeds a threshold), and the count of boards live in memory — concrete signals for load balancers and orchestrators. |
-| **Stateless auth with revocable sessions** | Short-lived **15-min JWT access tokens** (localStorage, `Authorization: Bearer`) paired with **7-day refresh tokens** in an `httpOnly`, `SameSite` cookie. Refresh tokens are stored only as **SHA-256 hashes** server-side and verified against the DB on every refresh, so logout is real revocation — a stolen access token dies in ≤15 min and can't be silently renewed (`backend/utils/jwt.js`, `POST /users/refresh` · `/logout`). |
+| **Stateless auth with revocable sessions** | Short-lived **15-min JWT access tokens** (`Authorization: Bearer`) paired with **7-day refresh tokens** in an `httpOnly`, `SameSite=Lax` cookie scoped to `/users`. Refresh tokens are stored only as **SHA-256 hashes** in `user.refreshTokens[]` and signed with a **separate secret** (`JWT_REFRESH_SECRET`); `POST /users/refresh` verifies the cookie cryptographically *and* against the DB, and `POST /users/logout` atomically revokes the stored hash — a stolen access token dies in ≤15 min and can't be silently renewed. |
+| **WebSocket ticket auth** | Before opening a WebSocket, the client calls `POST /users/ws-ticket` (authenticated) to get a 30-second single-use hex ticket stored in Redis. It's passed as `?ticket=<hex>` on the upgrade URL; the server DELetes it atomically in the HTTP upgrade gate before the WS handshake begins, so the JWT never appears in any URL, server log, or proxy access log. Share-link visitors use `?st=<shareToken>` and are capped at viewer access. |
 | **Graceful shutdown** | `SIGTERM`/`SIGINT` drain BullMQ workers, close queues, and quit Redis clients before process exit. |
 
 ---
@@ -48,7 +49,7 @@ This project's emphasis is a backend that is safe to scale across multiple insta
 - **Live presence:** real-time teammate cursors with name tags and a laser pointer, broadcast via Yjs Awareness.
 - **Comments & voting** on elements for async decision-making.
 - **Role-based sharing** (Viewer / Commenter / Editor) and public board publishing. Non-owners can leave a board or workspace; owners delete instead.
-- **Secure auth** with email/password and Google OAuth 2.0 — short-lived JWT access tokens with `httpOnly`-cookie refresh tokens (revocable on logout). Each email uses one method only, and password reset is via a single-use, enumeration-safe email link.
+- **Secure auth** with email/password and Google OAuth 2.0 — short-lived JWT access tokens with `httpOnly`-cookie refresh tokens (revocable on logout), and single-use Redis tickets for WebSocket connections so JWTs never appear in URLs. Each email uses one method only, and password reset is via a single-use, enumeration-safe email link.
 
 ---
 
@@ -136,6 +137,6 @@ npm run dev
 
 The frontend runs on `http://localhost:5173` and talks to the backend on `http://localhost:3030`.
 
-See [backend/README.md](backend/README.md) and [frontend/README.md](frontend/README.md) for environment-variable details.
+See [backend/README.md](backend/README.md) and [backend/.env.example](backend/.env.example) for the full list of environment variables (including `JWT_REFRESH_SECRET`, `JWT_EXPIRES_IN`, `JWT_REFRESH_EXPIRES_IN`, Cloudinary, and SMTP).
 
 ---

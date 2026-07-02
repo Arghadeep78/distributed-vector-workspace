@@ -16,11 +16,12 @@ The backend for the real-time collaborative workspace: a Node.js/Express service
 - **Distributed rate limiting** — `express-rate-limit` + `rate-limit-redis` with shared Redis counters across instances, split into auth (50/15 min) and general API (300/15 min) tiers.
 - **Board-metadata cache** — access metadata (`owner`, `collaborators`, `isPublic`, `publicRole`, workspace members) is Redis-cached (`board:meta:<id>`, 60 s TTL) with explicit invalidation on share / unshare / publish / delete / leave, removing a cold MongoDB read from every WebSocket connection.
 - **Self-service membership** — non-owner collaborators can leave a board (`DELETE /boards/leave/:id`) or a workspace (`DELETE /workspaces/:id/leave`, which also removes them from that workspace's boards); owners are rejected and must delete instead. Both paths invalidate the affected boards' metadata cache.
-- **External API resilience** — Gemini calls wrapped with a 10 s timeout, exponential-backoff retries (transient errors only), and a shared circuit breaker (5 failure threshold, 30 s cooldown).
+- **External API resilience** — Gemini calls wrapped with a 10 s timeout, exponential-backoff retries (transient errors only), and a shared circuit breaker (5 failure threshold, 30 s cooldown) (AI feature removed; patterns documented in `concepts.md`).
 - **Health & readiness probes** — `GET /health` (MongoDB + Redis) and `GET /ready` (+ BullMQ workers running, persist-queue backpressure via `getWaitingCount`, and active-board count). `/ready` reports `not-ready` when the flush backlog exceeds the threshold so an orchestrator stops adding load until it drains.
 - **Board publishing (synchronous)** — `POST /publish/:id` flips `isPublic`/`publicRole` with a single indexed MongoDB write and a cache invalidation, served inline in the request (a few ms). A previous BullMQ queue + worker for this was removed: a single fast write doesn't justify a queue, and queueing it returned `200` before the board was actually public. The queue is reserved for the persistence path, which is heavy and batched.
 - **Graceful shutdown** — `SIGTERM`/`SIGINT`/`SIGUSR2` drain workers, close queues, and quit Redis clients before process exit.
-- **Auth** — email/password and Google OAuth 2.0. **15-min JWT access tokens** (sent as `Authorization: Bearer`) are paired with **7-day refresh tokens** delivered in an `httpOnly`, `SameSite=Lax` cookie scoped to `/users`. Refresh tokens are persisted only as **SHA-256 hashes** (one entry per device) and signed with a **separate secret** from access tokens; `POST /users/refresh` verifies the cookie cryptographically *and* against the DB before minting a new access token, and `POST /users/logout` deletes the stored hash so the session is genuinely revoked. Each email is tied to exactly **one** method (password vs. Google); a custom-uploaded profile picture is never overwritten by a subsequent Google sign-in.
+- **Auth** — email/password and Google OAuth 2.0. **15-min JWT access tokens** (sent as `Authorization: Bearer`) are paired with **7-day refresh tokens** delivered in an `httpOnly`, `SameSite=Lax` cookie scoped to `/users`. Refresh tokens are persisted only as **SHA-256 hashes** in `user.refreshTokens[]` (one entry per device) and signed with a **separate secret** (`JWT_REFRESH_SECRET`) from access tokens; `POST /users/refresh` verifies the cookie cryptographically *and* against the DB before minting a new access token, and `POST /users/logout` pulls the stored hash atomically so the session is genuinely revoked. Each email is tied to exactly **one** method (password vs. Google); a custom-uploaded profile picture is never overwritten by a subsequent Google sign-in.
+- **WebSocket ticket auth** — before opening a WebSocket, the frontend calls `POST /users/ws-ticket` (authenticated) to receive a 30-second single-use hex ticket stored in Redis (`ws:ticket:<hex>`). The ticket is passed as `?ticket=<hex>` on the WS upgrade URL; the upgrade gate reads and immediately DELetes it before handing the socket off, so a JWT never appears in any WS URL, server log, or proxy access log. Share-link visitors use `?st=<shareToken>` instead and are granted anonymous-viewer access.
 - **Password reset** — `POST /users/forgot-password` emails a single-use link (SHA-256-hashed token, 15-min expiry, enumeration-safe generic response); `POST /users/reset-password/:token` verifies and sets the new password. Google-only accounts have no password, so they're excluded. Requires `EMAIL_USER`/`EMAIL_PASS` (Nodemailer/Gmail) and `FRONTEND_URL`.
 
 ---
@@ -52,20 +53,25 @@ backend/
 ├── middleware/
 │   ├── auth.middleware.js        # Access-token (JWT) verification → req.email
 │   ├── multer.middleware.js      # Multipart parsing: disk storage, 10 MB cap, MIME filter
+│   ├── validate.middleware.js    # Request body/param validation (fields helpers)
+│   ├── error.middleware.js       # Centralized Express error handler (APIError → HTTP response)
 │   └── rate-limiters.middleware.js  # Redis-backed rate limiters
 ├── utils/
-│   ├── jwt.js                   # Access + refresh token sign/verify helpers
+│   ├── jwt.js                   # signToken, verifyToken, signRefreshToken, verifyRefreshToken, getTokenExpiry
+│   ├── APIError.js              # Structured error class (statusCode + message)
+│   ├── APIResponse.js           # Structured success response helper
+│   ├── sendResponse.js          # res.json wrapper for consistent response shape
 │   ├── cloudinary.js            # Cloudinary SDK config + uploadToCloudinary() (temp-file cleanup)
 │   ├── role.js                  # resolveRole helper
 │   └── mailer.js                # Nodemailer: board invites & password-reset links
 ├── routes/
 │   ├── health.routes.js         # GET /health and GET /ready probe endpoints
 │   ├── project.routes.js
-│   ├── user.routes.js           # auth, refresh/logout, profile, uploads
+│   ├── user.routes.js           # auth, refresh/logout, profile, uploads, ws-ticket
 │   ├── publish.routes.js        # synchronous publish/unpublish
 │   └── workspace.routes.js
 ├── controllers/                 # Express route handlers (incl. upload.controller.js)
-├── models/                      # Mongoose schemas (user.model.js, whiteboard.model.js, workspace.model.js)
+├── models/                      # Mongoose schemas (user.model.js has refreshTokens[], whiteboard.model.js, workspace.model.js)
 └── index.js                     # Server bootstrap: HTTP + Yjs WS + workers + graceful shutdown
 ```
 
@@ -94,14 +100,16 @@ DB_CLUSTER_URL=cluster0.xxxxx.mongodb.net
 # Redis — Yjs pub/sub, board-metadata cache, rate-limit store, BullMQ
 REDIS_URL=redis://localhost:6379
 
-# Auth — JWT_SECRET signs access tokens; JWT_REFRESH_SECRET signs refresh tokens
-# (must be a DIFFERENT value so the two token types can't be swapped).
+# Auth — JWT_SECRET signs 15-min access tokens; JWT_REFRESH_SECRET signs 7-day
+# refresh tokens (must be DIFFERENT values so the two types can't be swapped).
 JWT_SECRET=your-jwt-secret
 JWT_REFRESH_SECRET=your-separate-refresh-secret
+JWT_EXPIRES_IN=15m            # optional; defaults to 15m
+JWT_REFRESH_EXPIRES_IN=7d     # optional; defaults to 7d
 GOOGLE_CLIENT_ID=your-google-oauth-client-id
 
-# Gemini (AI brainstorming)
-GOOGLE_API_KEY=your-gemini-api-key
+# Gemini (AI brainstorming) — AI feature removed; key no longer used
+# GOOGLE_API_KEY=your-gemini-api-key
 
 # Email (Nodemailer/Gmail) — board invites & password-reset links.
 # EMAIL_PASS must be a Gmail App Password (requires 2FA).

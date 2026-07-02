@@ -96,7 +96,7 @@ The realtime core. A custom WebSocket server that implements the full `y-protoco
 **Connection lifecycle:**
 
 1. **Auth buffering** — early messages from the client are buffered while async authentication runs, so the client's `SyncStep1` is never dropped.
-2. **JWT verification** — token extracted from the `?token=` query param and verified. Invalid tokens close the connection immediately.
+2. **Ticket/share-token gate** — at HTTP upgrade time (before the WebSocket handshake starts), the server reads either `?ticket=<hex>` (authenticated users) or `?st=<shareToken>` (anonymous share-link visitors). For tickets, the server does a Redis `GET` + `DEL` in the upgrade handler: if the key is missing/expired the socket is rejected with HTTP 401, otherwise `request.wsUserId` is set to the user's email and the ticket is consumed immediately (single-use). A JWT never appears in any WebSocket URL, server log, or proxy access log.
 3. **Role resolution** — `resolveRole(boardMeta, userEmail)` determines the effective role:
    - Owner → `'editor'`
    - Named collaborator → their assigned role
@@ -276,7 +276,7 @@ Startup sequence (sequential, each step waits for the previous):
 
 ### 5.1 Yjs Client Integration (`crdt/useYjsBoard.js`)
 
-- Creates a `Y.Doc` and connects via `WebsocketProvider` from `y-websocket` to `ws://<BACKEND_URL>/yjs/<boardId>?token=<jwt>`.
+- Creates a `Y.Doc` and connects via `WebsocketProvider` from `y-websocket` to `ws://<BACKEND_URL>/yjs/<boardId>?ticket=<hex>` (or `?st=<shareToken>` for share-link visitors). Before opening the WebSocket, the client calls `POST /users/ws-ticket` (authenticated, `Authorization: Bearer`) to obtain a 30-second single-use ticket, then appends it as `?ticket=` on the upgrade URL — the JWT never appears in the WS URL.
 - Tracks `hasSyncedOnceRef` — after the first successful sync, the `synced` flag stays `true` even on transient disconnects. This prevents the canvas from unmounting and flashing blank during network blips.
 - Cleans up the provider on component unmount.
 
@@ -349,7 +349,7 @@ Y.Doc
 | Collection | Key fields |
 |---|---|
 | `whiteboards` | `id`, `title`, `owner`, `collaborators`, `yjsState` (Buffer), `isPublic`, `publicRole` |
-| `users` | `email`, `name`, `passwordHash`, `profilePicture` |
+| `users` | `email`, `name`, `passwordHash`, `profilePicture`, `refreshTokens` (array of `{ tokenHash, expiresAt }`, `select:false`) |
 | `workspaces` | `name`, `owner`, `members` |
 
 ---
@@ -373,6 +373,7 @@ Redis serves four distinct purposes in this system:
 | Yjs cross-instance fanout | `yjs:<boardId>` pub/sub channel | Binary Yjs update frames, base64-encoded for Redis |
 | Awareness cross-instance relay | `awareness:<boardId>` pub/sub channel | `<instanceId>\|<base64 awareness frame>`; instance prefix lets the publisher skip its own echo |
 | Board metadata cache | `board:meta:<boardId>` | JSON, 60 s TTL, explicit invalidation |
+| WebSocket auth tickets | `ws:ticket:<hex>` | 30 s TTL, single-use; set by `POST /users/ws-ticket`, consumed-and-deleted atomically in the HTTP upgrade gate |
 | BullMQ job queues | BullMQ internal keys | `noeviction` policy required |
 | Rate-limit counters | `rate-limit-redis` internal keys | Shared across instances |
 
@@ -427,9 +428,14 @@ Cursor positions and user metadata are ephemeral — they live in the Yjs Awaren
 │   ├── middleware/
 │   │   ├── auth.middleware.js
 │   │   ├── multer.middleware.js     # multipart parsing (size cap + MIME filter)
+│   │   ├── validate.middleware.js   # request body validation (fields helpers)
+│   │   ├── error.middleware.js      # centralized Express error handler (APIError → HTTP)
 │   │   └── rate-limiters.middleware.js
 │   ├── utils/
-│   │   ├── jwt.js                   # access + refresh token helpers
+│   │   ├── jwt.js                   # signToken, verifyToken, signRefreshToken, verifyRefreshToken, getTokenExpiry
+│   │   ├── APIError.js              # Structured error class (statusCode + message)
+│   │   ├── APIResponse.js           # Structured success response helper
+│   │   ├── sendResponse.js          # Thin res.json wrapper for consistent response shape
 │   │   ├── cloudinary.js           # Cloudinary config + upload helper
 │   │   ├── role.js
 │   │   └── mailer.js
